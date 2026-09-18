@@ -1,0 +1,389 @@
+
+# ─────────────────────────────────────────────────────────────
+# .github/workflows/ci.yml
+# DisasterZero — Continuous Integration Pipeline
+# ─────────────────────────────────────────────────────────────
+# Triggers: Push to any branch, PRs to main/develop
+# Stages: Lint → Test → Security → Terraform → Build → Report
+# ─────────────────────────────────────────────────────────────
+
+name: "🛡️ DisasterZero CI"
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  TERRAFORM_VERSION: "1.5.7"
+  PROJECT_NAME: "disasterzero"
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # Stage 1: Code Quality & Linting
+  # ═══════════════════════════════════════════════════════════
+  lint:
+    name: "🔍 Lint & Format"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install linting tools
+        run: |
+          pip install --upgrade pip
+          pip install ruff black isort mypy
+
+      - name: Run Ruff (linter)
+        run: ruff check src/ tests/ --output-format=github
+
+      - name: Run Black (formatter check)
+        run: black --check --diff src/ tests/
+
+      - name: Run isort (import sorting)
+        run: isort --check-only --diff src/ tests/
+
+      - name: Run MyPy (type checking)
+        run: |
+          pip install -r requirements.txt
+          mypy src/ --ignore-missing-imports --no-error-summary || true
+        continue-on-error: true  # Advisory for now
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 2: Unit Tests
+  # ═══════════════════════════════════════════════════════════
+  unit-tests:
+    name: "🧪 Unit Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint]
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            -v \
+            --tb=short \
+            --junitxml=reports/unit-results.xml \
+            --cov=src \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+        env:
+          ENVIRONMENT: dev
+          DATABRICKS_HOST: "https://mock-workspace.cloud.databricks.com"
+          DATABRICKS_TOKEN: "dapi_mock_token"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results-py${{ matrix.python-version }}
+          path: reports/
+          retention-days: 14
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always() && matrix.python-version == '3.11'
+        with:
+          files: reports/unit-results.xml
+          check_name: "Unit Test Results"
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 3: Integration Tests
+  # ═══════════════════════════════════════════════════════════
+  integration-tests:
+    name: "🔗 Integration Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [unit-tests]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ \
+            -v \
+            --tb=short \
+            --junitxml=reports/integration-results.xml
+        env:
+          ENVIRONMENT: dev
+          DATABRICKS_HOST: "https://mock-workspace.cloud.databricks.com"
+          DATABRICKS_TOKEN: "dapi_mock_token"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: reports/
+          retention-days: 14
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 4: End-to-End Tests
+  # ═══════════════════════════════════════════════════════════
+  e2e-tests:
+    name: "🚀 E2E Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [integration-tests]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run E2E tests
+        run: |
+          pytest tests/e2e/ \
+            -v \
+            --tb=long \
+            --junitxml=reports/e2e-results.xml
+        env:
+          ENVIRONMENT: dev
+          DATABRICKS_HOST: "https://mock-workspace.cloud.databricks.com"
+          DATABRICKS_TOKEN: "dapi_mock_token"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results
+          path: reports/
+          retention-days: 14
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 5: Security Scanning
+  # ═══════════════════════════════════════════════════════════
+  security:
+    name: "🔒 Security Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install security tools
+        run: |
+          pip install --upgrade pip
+          pip install bandit safety pip-audit
+
+      - name: Run Bandit (code security)
+        run: |
+          bandit -r src/ \
+            -f json \
+            -o reports/bandit-report.json \
+            --severity-level medium \
+            --confidence-level medium \
+            || true
+          bandit -r src/ --severity-level high --confidence-level high
+
+      - name: Run pip-audit (dependency vulnerabilities)
+        run: |
+          pip install -r requirements.txt
+          pip-audit --format=json --output=reports/pip-audit.json || true
+          pip-audit --strict
+        continue-on-error: true
+
+      - name: Check for secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: reports/
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 6: Terraform Validation
+  # ═══════════════════════════════════════════════════════════
+  terraform-validate:
+    name: "🏗️ Terraform Validate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: terraform/
+
+      - name: Terraform Init (validation only)
+        run: terraform init -backend=false
+        working-directory: terraform/
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: terraform/
+
+      - name: Run tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init tflint
+        run: tflint --init
+        working-directory: terraform/
+
+      - name: Run tflint
+        run: tflint --recursive --format=compact
+        working-directory: terraform/
+
+      - name: Run tfsec (security)
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/
+          soft_fail: true
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 7: Docker Build Test
+  # ═══════════════════════════════════════════════════════════
+  docker-build:
+    name: "🐳 Docker Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [unit-tests]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (test only)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.PROJECT_NAME }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          docker run --rm ${{ env.PROJECT_NAME }}:test python -c "
+          from src.config import DisasterZeroConfig, Environment
+          print('✅ DisasterZero Docker image OK')
+          print(f'   Environment: {Environment.DEV.value}')
+          "
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 8: CI Summary
+  # ═══════════════════════════════════════════════════════════
+  ci-summary:
+    name: "📊 CI Summary"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit-tests, integration-tests, e2e-tests, security, terraform-validate, docker-build]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Generate CI summary
+        run: |
+          echo "## 🛡️ DisasterZero CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint & Format | ${{ needs.lint.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Tests | ${{ needs.e2e-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security.result == 'success' && '✅ Passed' || '⚠️ Issues' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform | ${{ needs.terraform-validate.result == 'success' && '✅ Valid' || '❌ Invalid' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build | ${{ needs.docker-build.result == 'success' && '✅ Built' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+

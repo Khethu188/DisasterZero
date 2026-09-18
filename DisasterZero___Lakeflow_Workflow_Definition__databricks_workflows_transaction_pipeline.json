@@ -1,0 +1,141 @@
+
+{
+  "name": "disasterzero-transaction-pipeline",
+  "description": "Financial transaction ETL pipeline — DisasterZero target workflow. Ingests from S3, transforms through Bronze/Silver/Gold layers with data quality checks.",
+  "tags": {
+    "project": "DisasterZero",
+    "team": "data-engineering",
+    "environment": "dev",
+    "criticality": "high"
+  },
+  "tasks": [
+    {
+      "task_key": "setup_schema",
+      "description": "Create Unity Catalog schemas and Delta tables (idempotent)",
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/setup_schema",
+        "source": "GIT"
+      },
+      "timeout_seconds": 300,
+      "max_retries": 1,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "generate_data",
+      "description": "Generate sample transaction data with anomalies and duplicates",
+      "depends_on": [
+        { "task_key": "setup_schema" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/generate_sample_data",
+        "source": "GIT"
+      },
+      "timeout_seconds": 600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "ingest_bronze",
+      "description": "Ingest raw transactions from S3 into Bronze Delta table",
+      "depends_on": [
+        { "task_key": "generate_data" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/transaction_ingestion",
+        "source": "GIT"
+      },
+      "timeout_seconds": 600,
+      "max_retries": 2,
+      "retry_on_timeout": true,
+      "min_retry_interval_millis": 30000
+    },
+    {
+      "task_key": "transform_silver",
+      "description": "Clean, validate, deduplicate → Silver layer. PRIMARY FAILURE TARGET for DisasterZero.",
+      "depends_on": [
+        { "task_key": "ingest_bronze" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/transaction_transformation",
+        "source": "GIT"
+      },
+      "timeout_seconds": 900,
+      "max_retries": 2,
+      "retry_on_timeout": true,
+      "min_retry_interval_millis": 30000
+    },
+    {
+      "task_key": "build_gold_analytics",
+      "description": "Build Gold analytics tables — daily summary, account metrics, risk scores, pipeline health",
+      "depends_on": [
+        { "task_key": "transform_silver" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/transaction_analytics",
+        "source": "GIT"
+      },
+      "timeout_seconds": 900,
+      "max_retries": 2,
+      "retry_on_timeout": true,
+      "min_retry_interval_millis": 30000
+    },
+    {
+      "task_key": "verify_pipeline_health",
+      "description": "Final verification — checks record counts, data consistency, and pipeline health",
+      "depends_on": [
+        { "task_key": "build_gold_analytics" }
+      ],
+      "condition_task": {
+        "op": "EQUAL_TO",
+        "left": "{{tasks.build_gold_analytics.result_state}}",
+        "right": "SUCCESS"
+      },
+      "notebook_task": {
+        "notebook_path": "/Repos/disasterzero/databricks/notebooks/verify_pipeline",
+        "source": "GIT"
+      },
+      "timeout_seconds": 300,
+      "max_retries": 0
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "pipeline_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true"
+        },
+        "custom_tags": {
+          "project": "DisasterZero",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "queue": {
+    "enabled": true
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 6 * * ?",
+    "timezone_id": "Africa/Johannesburg",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": {
+    "on_failure": ["disasterzero-alerts@example.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "disasterzero-webhook"
+      }
+    ]
+  },
+  "max_concurrent_runs": 1,
+  "format": "MULTI_TASK"
+}
+

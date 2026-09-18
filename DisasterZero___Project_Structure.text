@@ -1,0 +1,96 @@
+
+DisasterZero/
+│
+├── README.md
+├── requirements.txt
+├── setup.py
+├── .env.example
+├── .gitignore
+├── docker-compose.yml
+├── Makefile
+│
+├── terraform/                          # Infrastructure as Code
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── modules/
+│   │   ├── vpc/
+│   │   ├── ec2/
+│   │   ├── rds/
+│   │   ├── s3/
+│   │   └── monitoring/
+│   └── environments/
+│       ├── dev.tfvars
+│       └── prod.tfvars
+│
+├── databricks/                         # Databricks Pipelines
+│   ├── notebooks/
+│   │   ├── transaction_ingestion.py
+│   │   ├── transaction_transformation.py
+│   │   └── transaction_analytics.py
+│   ├── workflows/
+│   │   └── transaction_pipeline.json
+│   └── setup/
+│       └── workspace_config.py
+│
+├── src/
+│   ├── __init__.py
+│   ├── config.py                       # Central configuration
+│   │
+│   ├── simulator/                      # Failure Simulator
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── aws_failures.py
+│   │   ├── databricks_failures.py
+│   │   └── scenarios.py
+│   │
+│   ├── detector/                       # Detection Engine
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── aws_detector.py
+│   │   ├── databricks_detector.py
+│   │   └── alert_manager.py
+│   │
+│   ├── recovery/                       # Recovery Engine
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── aws_recovery.py
+│   │   ├── databricks_recovery.py
+│   │   └── strategies.py
+│   │
+│   ├── verifier/                       # Verification Engine
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── data_verifier.py
+│   │   ├── infra_verifier.py
+│   │   └── rto_rpo.py
+│   │
+│   ├── datatrust_bridge/              # DataTrust Integration
+│   │   ├── __init__.py
+│   │   └── quality_gate.py
+│   │
+│   ├── reporting/                      # Recovery Reports
+│   │   ├── __init__.py
+│   │   └── report_generator.py
+│   │
+│   └── orchestrator/                   # Main Orchestrator
+│       ├── __init__.py
+│       └── engine.py
+│
+├── dashboard/                          # Streamlit Dashboard
+│   ├── app.py
+│   └── pages/
+│       ├── overview.py
+│       ├── incidents.py
+│       └── reports.py
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── e2e/
+│
+└── .github/
+    └── workflows/
+        ├── ci.yml
+        └── cd.yml
+

@@ -1,0 +1,139 @@
+
+# ─────────────────────────────────────────────────────────────
+# .github/workflows/nightly-drill.yml
+# DisasterZero — Nightly Disaster Recovery Drill
+# ─────────────────────────────────────────────────────────────
+# Runs the full DisasterZero test suite against dev environment
+# every night at 2 AM SAST (midnight UTC).
+# ─────────────────────────────────────────────────────────────
+
+name: "🌙 Nightly Disaster Drill"
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # Midnight UTC = 2 AM SAST
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Scenarios to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - databricks_job_failure
+          - data_corruption
+          - ec2_instance_stop
+          - s3_access_denied
+          - cluster_termination
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  AWS_REGION: "af-south-1"
+
+jobs:
+  disaster-drill:
+    name: "🛡️ Run Disaster Drill"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run disaster drill
+        id: drill
+        run: |
+          SCENARIOS="${{ github.event.inputs.scenarios || 'all' }}"
+          echo "🛡️ Running disaster drill: ${SCENARIOS}"
+
+          python -m src.orchestrator.engine \
+            --environment dev \
+            --scenarios "${SCENARIOS}" \
+            --output-dir reports/ \
+            --format json,markdown \
+            2>&1 | tee drill-output.txt
+
+          # Check if drill passed
+          if grep -q '"pass_rate": 100.0' reports/*.json 2>/dev/null; then
+            echo "drill_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "drill_passed=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
+      - name: Upload drill reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drill-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 90
+
+      - name: Upload to S3
+        if: always()
+        run: |
+          aws s3 sync reports/ \
+            s3://${{ secrets.REPORTS_BUCKET }}/nightly-drills/$(date +%Y-%m-%d)/ \
+            --exclude "*.pyc"
+
+      - name: Generate drill summary
+        if: always()
+        run: |
+          echo "## 🌙 Nightly Disaster Drill — $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f reports/*.json ]; then
+            python -c "
+          import json, glob
+
+          for f in glob.glob('reports/*suite*.json'):
+              with open(f) as fh:
+                  data = json.load(fh)
+              print(f'| Metric | Value |')
+              print(f'|--------|-------|')
+              print(f'| Total Scenarios | {data.get(\"total_scenarios\", \"N/A\")} |')
+              print(f'| Passed | {data.get(\"scenarios_passed\", \"N/A\")} |')
+              print(f'| Failed | {data.get(\"scenarios_failed\", \"N/A\")} |')
+              print(f'| Pass Rate | {data.get(\"pass_rate\", \"N/A\")}% |')
+              print(f'| Avg RTO | {data.get(\"avg_rto_seconds\", \"N/A\")}s |')
+              print(f'| Max RTO | {data.get(\"max_rto_seconds\", \"N/A\")}s |')
+              print(f'| Total Records Lost | {data.get(\"total_records_lost\", \"N/A\")} |')
+              break
+            " >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No report files found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Alert on failure
+        if: steps.drill.outputs.drill_passed == 'false'
+        run: |
+          echo "::warning::Nightly disaster drill had failures! Check the drill report."
+          # Could add SNS/Slack notification here
+

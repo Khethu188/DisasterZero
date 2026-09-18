@@ -1,0 +1,359 @@
+
+# ─────────────────────────────────────────────────────────────
+# .github/workflows/cd.yml
+# DisasterZero — Continuous Deployment Pipeline
+# ─────────────────────────────────────────────────────────────
+# Triggers: Push to main (after CI passes)
+# Stages: Plan → Approve → Deploy → Smoke Test → Notify
+# ─────────────────────────────────────────────────────────────
+
+name: "🚀 DisasterZero CD"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      skip_tests:
+        description: "Skip test stage (emergency deploy)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write  # For OIDC with AWS
+
+env:
+  PYTHON_VERSION: "3.11"
+  TERRAFORM_VERSION: "1.5.7"
+  AWS_REGION: "af-south-1"
+  PROJECT_NAME: "disasterzero"
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false  # Never cancel deployments
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # Stage 1: Determine Environment
+  # ═══════════════════════════════════════════════════════════
+  setup:
+    name: "⚙️ Setup"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      is_prod: ${{ steps.env.outputs.is_prod }}
+
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          else
+            ENV="dev"
+          fi
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "is_prod=$( [ "$ENV" == "prod" ] && echo 'true' || echo 'false' )" >> $GITHUB_OUTPUT
+          echo "🎯 Deploying to: ${ENV}"
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 2: Run CI (unless skipped)
+  # ═══════════════════════════════════════════════════════════
+  ci-gate:
+    name: "🧪 CI Gate"
+    needs: [setup]
+    if: ${{ github.event.inputs.skip_tests != 'true' }}
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 3: Terraform Plan
+  # ═══════════════════════════════════════════════════════════
+  terraform-plan:
+    name: "📋 Terraform Plan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [setup, ci-gate]
+    if: always() && (needs.ci-gate.result == 'success' || needs.ci-gate.result == 'skipped')
+
+    environment: ${{ needs.setup.outputs.environment }}
+
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform/
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="environments/${{ needs.setup.outputs.environment }}.tfvars" \
+            -out="tfplan" \
+            -detailed-exitcode \
+            2>&1 | tee plan-output.txt
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+        working-directory: terraform/
+        env:
+          TF_VAR_databricks_host: ${{ secrets.DATABRICKS_HOST }}
+          TF_VAR_databricks_token: ${{ secrets.DATABRICKS_TOKEN }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+        continue-on-error: true
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/tfplan
+          retention-days: 7
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n...(truncated)' : plan;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🏗️ Terraform Plan — \`${{ needs.setup.outputs.environment }}\`\n\n<details>\n<summary>Show Plan</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n\n</details>`
+            });
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 4: Manual Approval (prod only)
+  # ═══════════════════════════════════════════════════════════
+  approve-prod:
+    name: "✋ Production Approval"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [setup, terraform-plan]
+    if: needs.setup.outputs.is_prod == 'true' && needs.terraform-plan.outputs.has_changes == 'true'
+
+    environment:
+      name: prod-approval
+
+    steps:
+      - name: Approval received
+        run: echo "✅ Production deployment approved by ${{ github.actor }}"
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 5: Deploy Infrastructure
+  # ═══════════════════════════════════════════════════════════
+  deploy-infra:
+    name: "🏗️ Deploy Infrastructure"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [setup, terraform-plan, approve-prod]
+    if: |
+      always() &&
+      needs.terraform-plan.outputs.has_changes == 'true' &&
+      (needs.approve-prod.result == 'success' || needs.approve-prod.result == 'skipped')
+
+    environment: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform/
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform/
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: terraform/
+        env:
+          TF_VAR_databricks_host: ${{ secrets.DATABRICKS_HOST }}
+          TF_VAR_databricks_token: ${{ secrets.DATABRICKS_TOKEN }}
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Export outputs
+        run: |
+          terraform output -json > ../deployment-outputs.json
+          echo "📦 Infrastructure deployed successfully"
+        working-directory: terraform/
+
+      - name: Upload deployment outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-outputs
+          path: deployment-outputs.json
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 6: Deploy Application
+  # ═══════════════════════════════════════════════════════════
+  deploy-app:
+    name: "📦 Deploy Application"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [setup, deploy-infra]
+
+    environment: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download deployment outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-outputs
+
+      - name: Deploy to EC2
+        run: |
+          INSTANCE_ID=$(jq -r '.app_instance_id.value' deployment-outputs.json)
+          echo "Deploying to instance: ${INSTANCE_ID}"
+
+          # Send deploy command via SSM
+          aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "cd /opt/DisasterZero",
+              "git pull origin ${{ github.ref_name }}",
+              "pip3.11 install -r requirements.txt",
+              "systemctl restart disasterzero-dashboard"
+            ]' \
+            --timeout-seconds 300 \
+            --comment "DisasterZero deploy ${{ github.sha }}"
+
+          echo "✅ Application deployed"
+
+      - name: Sync Databricks notebooks
+        run: |
+          pip install databricks-cli
+          databricks repos update \
+            --path "/Repos/${{ env.PROJECT_NAME }}" \
+            --branch "${{ github.ref_name }}"
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 7: Smoke Tests
+  # ═══════════════════════════════════════════════════════════
+  smoke-tests:
+    name: "💨 Smoke Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [setup, deploy-app]
+
+    environment: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install boto3 requests
+
+      - name: Download deployment outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-outputs
+
+      - name: Run smoke tests
+        run: |
+          python scripts/smoke_test.py \
+            --environment ${{ needs.setup.outputs.environment }} \
+            --outputs deployment-outputs.json
+
+  # ═══════════════════════════════════════════════════════════
+  # Stage 8: Notification
+  # ═══════════════════════════════════════════════════════════
+  notify:
+    name: "📢 Notify"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [setup, deploy-infra, deploy-app, smoke-tests]
+    if: always()
+
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "## 🛡️ DisasterZero Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ needs.setup.outputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure | ${{ needs.deploy-infra.result == 'success' && '✅ Deployed' || needs.deploy-infra.result == 'skipped' && '⏭️ No changes' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | ${{ needs.deploy-app.result == 'success' && '✅ Deployed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ${{ needs.smoke-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Actor | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+
